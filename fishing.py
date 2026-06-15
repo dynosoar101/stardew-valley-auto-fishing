@@ -23,21 +23,18 @@ def fish():
         # gets a screenshot of a 100x100 pixel area at the center of the screen
         center_x = monitor_width // 2
         center_y = monitor_height // 2
-        screenshot = ImageGrab.grab(bbox=(center_x - 50, center_y - 50, center_x + 50, center_y + 50), all_screens=True)
+        screenshot = ImageGrab.grab(bbox=(center_x - 200, center_y - 300, center_x + 200, center_y + 200), all_screens=True)
 
         # Convert to OpenCV format
         img = cv2.cvtColor(numpy.array(screenshot), cv2.COLOR_RGB2BGR)
         # Define the color range for yellow exclamation points 255, 232, 53
-        lower_yellow = numpy.array([225, 202, 23])
-        upper_yellow = numpy.array([255, 252, 83])
-
+        lower_yellow = numpy.array([0, 210, 230])
+        upper_yellow = numpy.array([60, 245, 255])
         # Create a mask for the yellow color
         mask = cv2.inRange(img, lower_yellow, upper_yellow)
         # Check if any yellow pixels are detected
         if cv2.countNonZero(mask) > 0:
-            print("Yellow detected!")
-            pyautogui.press('win')
-            break
+            break 
         #sleep for 0.1 seconds
         time.sleep(0.1)
         print("end of loop")
