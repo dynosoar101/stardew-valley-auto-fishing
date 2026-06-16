@@ -24,13 +24,13 @@ def minigame():
 
 
     while True:
-        # gets a screenshot of a 100x100 pixel area at the center of the screen
+        #screenshot of the minigame area only
         screenshot = ImageGrab.grab(bbox=(minigame_left, minigame_top, minigame_right, minigame_bottom), all_screens=True)
 
         img_bgr = cv2.cvtColor(numpy.array(screenshot), cv2.COLOR_RGB2BGR)
         hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
-        # Create masks
+        # Create masks for fish and the green bar
         fish_mask = cv2.inRange(hsv, lower_fish, upper_fish)
         bar_mask = cv2.inRange(hsv, lower_green, upper_green)
 
@@ -40,7 +40,7 @@ def minigame():
 
         if fish_coords[0].size >= 0:
             fish_y = (numpy.mean(fish_coords[0]))
-            bar_center_y = (numpy.mean(bar_coords[0]))
+            bar_center_y = (bar_coords[0]/2)
             print(f"Fish Y: {fish_y}, Bar Y: {bar_center_y}")
             if fish_y < bar_center_y:
                 pyautogui.mouseDown()

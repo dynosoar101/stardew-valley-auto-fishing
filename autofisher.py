@@ -14,6 +14,7 @@ print("script started")
 while True:
     cast.cast()
     time.sleep(2)
+    print("armed")
     fishing.fish()
     #click
     pyautogui.mouseDown()   # hold left click
