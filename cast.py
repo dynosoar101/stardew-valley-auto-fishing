@@ -6,6 +6,6 @@ import pyautogui
 
 def cast():
     pyautogui.mouseDown()   # hold left click
-    time.sleep(1)           # wait for full power
+    time.sleep(0.9)        # wait for full power
     pyautogui.mouseUp()   # release left click
-    time.sleep(0.5)     #half second delay before termination
+    time.sleep(2)     #half second delay before termination
