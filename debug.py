@@ -7,6 +7,7 @@ import pyautogui
 from PIL import ImageGrab
 import cv2
 import numpy
+import mss
 
 
 print("compiled fine")
@@ -78,3 +79,48 @@ while True:
     time.sleep(0.1)
     print("end of loop")
     '''
+
+import mss
+import cv2
+import numpy
+
+monitor_width = 2560
+monitor_height = 1440
+
+region = {
+    
+    "left":   int(monitor_width * 0.384),
+    "top":    int(monitor_height * 0.209),
+    "width":  int(monitor_width * 0.455) - int(monitor_width * 0.384),
+    "height": int(monitor_height * 0.646) - int(monitor_height * 0.209)
+}
+
+with mss.mss() as sct:
+    input("Press Enter when minigame is active...")
+    frame = numpy.array(sct.grab(region))
+    img_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    h, w = hsv.shape[:2]
+    
+    cv2.imwrite('scan_region.png', img_bgr)
+    print(f"Size: {w}x{h}")
+    
+    # Scan across ALL columns at mid-height to find where green/fish are
+    mid_y = h // 2
+    print(f"\nScanning horizontally at y={mid_y}:")
+    for x in range(0, w, 5):
+        px = hsv[mid_y, x]
+        bgr = img_bgr[mid_y, x]
+        print(f"  x={x}: HSV{tuple(int(v) for v in px)} BGR{tuple(int(v) for v in bgr)}")
+    
+    # Also find all green pixels and report where they are
+    lower_green = numpy.array([40, 150, 150])
+    upper_green = numpy.array([90, 255, 255])
+    mask = cv2.inRange(hsv, lower_green, upper_green)
+    coords = numpy.where(mask > 0)
+    if coords[0].size > 0:
+        print(f"\nGreen pixels found!")
+        print(f"  X range: {coords[1].min()} to {coords[1].max()}")
+        print(f"  Y range: {coords[0].min()} to {coords[0].max()}")
+    else:
+        print("\nNo green pixels found with current range")

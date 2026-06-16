@@ -12,8 +12,9 @@ print("script started, autofishing beginning in 5 seconds")
 time.sleep(5)
 print("script started")
 while True:
+    print("casting")
     cast.cast()
-    time.sleep(2)
+    time.sleep(0.15)
     print("armed")
     fishing.fish()
     #click
@@ -22,4 +23,11 @@ while True:
     pyautogui.mouseUp()
     #time.sleep(1) 
     #end of fish method means a fish has been detected
+    time.sleep(2)
     minigame.minigame()
+    pyautogui.mouseDown()   # hold left click
+    time.sleep(0.01)           # wait for full power
+    pyautogui.mouseUp()
+    print("minigame complete")
+    time.sleep(3)
+    
