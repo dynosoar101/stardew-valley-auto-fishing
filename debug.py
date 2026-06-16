@@ -8,7 +8,13 @@ from PIL import ImageGrab
 import cv2
 import numpy
 import mss
+import os
 
+ASSETS = os.path.join(os.path.dirname(__file__), 'image_assets')
+print(f"Looking in: {ASSETS}")
+print("Files found:")
+for f in os.listdir(ASSETS):
+    print(f"  {f}")
 
 print("compiled fine")
 
@@ -79,7 +85,7 @@ while True:
     time.sleep(0.1)
     print("end of loop")
     '''
-
+'''
 import mss
 import cv2
 import numpy
@@ -124,3 +130,4 @@ with mss.mss() as sct:
         print(f"  Y range: {coords[0].min()} to {coords[0].max()}")
     else:
         print("\nNo green pixels found with current range")
+        '''
