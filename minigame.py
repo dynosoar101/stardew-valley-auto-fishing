@@ -1,19 +1,60 @@
 import time
-import os
-import csv
-import threading
+import torch
+import torch.nn as nn
 import mss
 import cv2
 import numpy
-from pynput import mouse, keyboard
+import pyautogui
+from torchvision import transforms
+from PIL import Image
 
-# ── Output directory ──────────────────────────────────────────────────────────
-SESSION = time.strftime("%Y%m%d_%H%M%S")
-OUT_DIR = os.path.join(os.path.dirname(__file__), f"training_data/{SESSION}")
-FRAMES_DIR = os.path.join(OUT_DIR, "frames")
-os.makedirs(FRAMES_DIR, exist_ok=True)
+# ── Model (must match cnn_training.py exactly) ────────────────────────────────
+class FishingCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(0.25),
 
-# ── Capture region (unchanged from minigame.py) ───────────────────────────────
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(0.25),
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(0.25),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 16 * 4, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.classifier(self.features(x)).squeeze(1)
+
+# ── Load model ────────────────────────────────────────────────────────────────
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = FishingCNN().to(device)
+model.load_state_dict(torch.load("model.pt", map_location=device))
+model.eval()
+print(f"Model loaded on {device}")
+
+# ── Capture region (same as training) ────────────────────────────────────────
 REGION = {
     "left":   int(2560 * 0.420),
     "top":    int(1440 * 0.250),
@@ -21,64 +62,44 @@ REGION = {
     "height": int(1440 * 0.66)  - int(1440 * 0.250),
 }
 
-# ── Shared input state ────────────────────────────────────────────────────────
-mouse_held = False
-state_lock = threading.Lock()
+transform = transforms.Compose([
+    transforms.Resize((128, 32)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
 
-def on_click(x, y, button, pressed):
-    global mouse_held
-    if button == mouse.Button.left:
-        with state_lock:
-            mouse_held = pressed
+# ── Minigame loop ─────────────────────────────────────────────────────────────
+def minigame():
+    print("Minigame started")
+    last_held = None
+    no_minigame_since = None
 
-def on_release(key):
-    if key == keyboard.Key.f8:
-        print("\nF8 pressed — stopping capture.")
-        return False
-
-# ── CSV log ───────────────────────────────────────────────────────────────────
-csv_path = os.path.join(OUT_DIR, "labels.csv")
-csv_file = open(csv_path, "w", newline="")
-csv_writer = csv.writer(csv_file)
-csv_writer.writerow(["frame_file", "timestamp", "mouse_left"])
-
-# ── Listeners ─────────────────────────────────────────────────────────────────
-mouse_listener    = mouse.Listener(on_click=on_click)
-keyboard_listener = keyboard.Listener(on_release=on_release)
-mouse_listener.start()
-keyboard_listener.start()
-
-# ── Capture loop ──────────────────────────────────────────────────────────────
-print(f"Saving to: {OUT_DIR}")
-print("Recording — press F8 to stop.\n")
-
-frame_index = 0
-try:
     with mss.mss() as sct:
-        while keyboard_listener.is_alive():
-            t0 = time.perf_counter()
-
+        while True:
             frame = numpy.array(sct.grab(REGION))
-            img_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB))
+            tensor = transform(img).unsqueeze(0).to(device)
 
-            with state_lock:
-                held = int(mouse_held)
+            with torch.no_grad():
+                confidence = model(tensor).item()
 
-            fname = f"{frame_index:06d}.png"
-            cv2.imwrite(os.path.join(FRAMES_DIR, fname), img_bgr)
-            csv_writer.writerow([fname, f"{time.time():.6f}", held])
+            hold = confidence > 0.5
 
-            frame_index += 1
+            if hold != last_held:
+                if hold:
+                    pyautogui.mouseDown()
+                else:
+                    pyautogui.mouseUp()
+                last_held = hold
 
-            elapsed = time.perf_counter() - t0
-            time.sleep(max(0.0, (1/60) - elapsed))
+            print(f"conf: {confidence:.2f}  {'HOLD' if hold else 'release'}")
 
-except KeyboardInterrupt:
-    print("\nCtrl+C — stopping.")
-
-finally:
-    mouse_listener.stop()
-    keyboard_listener.stop()
-    csv_file.flush()
-    csv_file.close()
-    print(f"\nDone. {frame_index} frames saved to {OUT_DIR}")
+            if confidence < 0.2:
+                if no_minigame_since is None:
+                    no_minigame_since = time.time()
+                elif time.time() - no_minigame_since > 1.0:
+                    pyautogui.mouseUp()
+                    print("Minigame complete")
+                    return
+            else:
+                no_minigame_since = None

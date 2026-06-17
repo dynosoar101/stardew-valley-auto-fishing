@@ -25,9 +25,9 @@ while True:
     #end of fish method means a fish has been detected
     time.sleep(2)
     minigame.minigame()
-    pyautogui.mouseDown()   
+    #pyautogui.mouseDown()   
     time.sleep(0.01)           
-    pyautogui.mouseUp()
+    #pyautogui.mouseUp()
     print("minigame complete")
     time.sleep(3)
     
