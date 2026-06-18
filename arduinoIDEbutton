@@ -1,0 +1,107 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ── Pin config ───────────────────────────────────────────────────────────────
+const int BUTTON_PIN = 0;
+const int SDA_PIN    = 8;
+const int SCL_PIN    = 9;
+
+// ── LCD ───────────────────────────────────────────────────────────────────────
+// Common I2C addresses: 0x27 or 0x3F — check yours with an I2C scanner sketch
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ── State ─────────────────────────────────────────────────────────────────────
+volatile bool buttonPressed = false;
+bool          scriptRunning = false;
+unsigned long lastDebounce  = 0;
+const unsigned long DEBOUNCE_MS = 300;
+
+// ── ISR ───────────────────────────────────────────────────────────────────────
+void IRAM_ATTR ISR() {
+  unsigned long now = millis();
+  if (now - lastDebounce > DEBOUNCE_MS) {
+    buttonPressed = true;
+    lastDebounce  = now;
+  }
+}
+
+// ── LCD helpers ───────────────────────────────────────────────────────────────
+void lcdPrint(const char* line1, const char* line2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+}
+
+// ── Handle status messages from Python ───────────────────────────────────────
+void handleStatus(String msg) {
+  msg.trim();
+
+  if (msg == "WAITING") {
+    lcdPrint("AutoFisher", "Press to start");
+
+  } else if (msg.startsWith("STARTING:")) {
+    int secs = msg.substring(9).toInt();
+    char buf[17];
+    snprintf(buf, sizeof(buf), "Starting in %ds", secs);
+    lcdPrint("Script armed!", buf);
+
+  } else if (msg == "ARMED") {
+    lcdPrint("ARMED", "Fishing...");
+
+  } else if (msg == "CASTING") {
+    lcdPrint("ARMED", "Casting rod...");
+
+  } else if (msg == "WAITING_FISH") {
+    lcdPrint("ARMED", "Waiting...");
+
+  } else if (msg == "FISH_DETECTED") {
+    lcdPrint("ARMED", "Fish! Hooking!");
+
+  } else if (msg == "MINIGAME") {
+    lcdPrint("ARMED", "Reeling in...");
+
+  } else if (msg == "CAUGHT") {
+    lcdPrint("ARMED", "Fish caught!");
+
+  } else if (msg == "STOPPED") {
+    scriptRunning = false;
+    lcdPrint("Stopped.", "Press to start");
+  }
+}
+
+// ── Setup ─────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  lcd.init();
+  lcd.backlight();
+  lcdPrint("AutoFisher", "Connecting...");
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), ISR, FALLING);
+}
+
+// ── Loop ──────────────────────────────────────────────────────────────────────
+void loop() {
+  if (buttonPressed) {
+    buttonPressed = false;
+
+    if (!scriptRunning) {
+      scriptRunning = true;
+      Serial.println("START");
+      lcdPrint("Starting...", "Please wait");
+    } else {
+      scriptRunning = false;
+      Serial.println("STOP");
+      lcdPrint("Stopping...", "");
+    }
+  }
+
+  if (Serial.available()) {
+    String msg = Serial.readStringUntil('\n');
+    handleStatus(msg);
+  }
+}
