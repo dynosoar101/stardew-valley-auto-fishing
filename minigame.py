@@ -40,7 +40,7 @@ fish_bgr = fish_img_raw[:, :, :3]
 fish_mask = fish_img_raw[:, :, 3]
 fish_h, fish_w = fish_bgr.shape[:2]
 
-# ── Vision Functions ──────────────────────────────────────────────────────────
+
 
 def is_valid_frame(gray_frame, threshold=0.6):
     """Returns True if the minigame UI is detected in the frame."""
@@ -62,7 +62,7 @@ def find_fish_template(bgr_frame, threshold=0.85):
         return max_loc[0], max_loc[1], max_val
     return None
 
-
+'''
 def find_green_bar(bgr_frame):
     """
     Finds the dynamic green catching bar using HSV masking.
@@ -117,6 +117,22 @@ def find_green_bar(bgr_frame):
             return real_x, y, w, h
             
     return None
+'''
+def find_green_bar(bgr_frame, level):
+    #hsv for upper and lower green bar bounds
+    lower = (50, 180, 180)
+    upper = (90, 255, 255)
+
+    #in pixels of fishing bar length
+    green_bar = 96 #base level
+    for i in range(level):
+        green_bar += 8
+    pass
+
+    #find an object matching the green bar bounds of length green_bar in pixels
+    #recommended to find it via an upper y value and lower y value. the total length should be at least green_bar - the size of fish
+    pass
+
 
 # ── Main Capture Loop ─────────────────────────────────────────────────────────
 stop_script = False
@@ -149,7 +165,9 @@ with mss.mss() as sct:
                 cv2.rectangle(frame_bgr, (fx, fy), (fx + fish_w, fy + fish_h), (0, 0, 255), 2)
                 cv2.putText(frame_bgr, f"Fish: {fscore:.2f}", (fx, max(0, fy - 5)), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-
+        
+                
+            '''
             # --- 2. Detect and Draw Green Bar ---
             bar_match = find_green_bar(frame_bgr)
             if bar_match is not None:
@@ -157,7 +175,7 @@ with mss.mss() as sct:
                 cv2.rectangle(frame_bgr, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
                 cv2.putText(frame_bgr, "Bar", (bx, max(0, by - 5)), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-
+            '''
             # Save the annotated frame
             frame_path = os.path.join(FRAMES_DIR, f"frame_{frame_index:04d}.png")
             cv2.imwrite(frame_path, frame_bgr)
