@@ -1,5 +1,6 @@
 import time
 import os
+import csv
 import mss
 import cv2
 import numpy as np
@@ -16,6 +17,8 @@ OUT_DIR    = os.path.join(SCRIPT_DIR, f"debug_frames/{SESSION}")
 FRAMES_DIR = os.path.join(OUT_DIR, "frames")
 os.makedirs(FRAMES_DIR, exist_ok=True)
 
+LOG_PATH = os.path.join(OUT_DIR, "physics_log.csv")
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 FISHING_LEVEL = 10
@@ -27,20 +30,35 @@ REGION = {
     "height": int(1440 * 0.660) - int(1440 * 0.250),
 }
 
-# Physics model constants — calibrated to frame data
-# GRAVITY:     px/s² the bar falls when mouse is up
-# CLICK_ACCEL: px/s² upward impulse applied while mouse is held
-GRAVITY     = 1250.0   # px/s² downward
-CLICK_ACCEL = 2100.0   # px/s² upward while mouse held
+# ── Physics model ─────────────────────────────────────────────────────────────
+# Starting guesses only — the model recalibrates GRAVITY and CLICK_ACCEL live
+# from observed detection deltas during clean press/release windows.
+GRAVITY_INIT     = 1250.0   # px/s² downward, refined at runtime
+CLICK_ACCEL_INIT = 2100.0   # px/s² upward while held, refined at runtime
 
-# How aggressively to snap the physics model to a fresh detection.
-# Lowered to 0.25 to trust the internal physics more and ignore partial-detection jitter.
-CORRECTION_ALPHA = 0.25
+# Blend rate for online recalibration of gravity/click-accel from real samples.
+ACCEL_LEARN_RATE = 0.20
+
+# When a fresh detection arrives, snap hard toward it (detection is reliable
+# per testing) rather than slow-blending — this is what "recalibrate the
+# instant the bar is found again" means in practice.
+DETECTION_SNAP_ALPHA = 0.85
 
 # Bar detection
 BAR_HSV_LOWER = np.array([43,  68, 196])
 BAR_HSV_UPPER = np.array([78, 255, 229])
 BAR_MIN_AREA  = 50
+
+# Gap-merge: the fish sprite is drawn ON TOP of the green bar and its
+# non-green pixels (blue/white/red scales) punch a hole through the color
+# mask, splitting one continuous bar into 2+ fragments. Fragments separated
+# by a small vertical gap are treated as one bar occluded by the fish,
+# rather than picking only the single largest fragment (which previously
+# produced wrong "partial" reconstructions whenever the fish overlapped
+# the bar — confirmed by comparing fish bbox rows directly against the
+# color-mask gap rows in captured frames).
+BAR_MERGE_GAP       = 70    # px — generous for the fish sprite's height
+BAR_MERGED_MIN_AREA = 300   # discard merged blobs smaller than this as noise
 
 # ── Assets ────────────────────────────────────────────────────────────────────
 
@@ -78,6 +96,13 @@ def find_fish_template(bgr_frame, threshold=0.85):
     return None
 
 def find_green_bar(bgr_frame, fish_y=None, level=0):
+    """
+    Detect the green catch-bar, merging fragments that were split apart by
+    the fish sprite occluding part of the bar. Fragments separated by a
+    small vertical gap (<= BAR_MERGE_GAP) are combined into one bar before
+    height/partial logic runs, so the fish passing over the bar no longer
+    produces a falsely-short "partial" reading.
+    """
     expected_h = get_bar_height(level)
     hsv  = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, BAR_HSV_LOWER, BAR_HSV_UPPER)
@@ -86,67 +111,177 @@ def find_green_bar(bgr_frame, fish_y=None, level=0):
     if num_labels < 2:
         return None
 
-    blobs = [
-        {
-            "top":    stats[i, cv2.CC_STAT_TOP],
-            "bottom": stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT],
-            "height": stats[i, cv2.CC_STAT_HEIGHT],
-            "area":   stats[i, cv2.CC_STAT_AREA],
-        }
-        for i in range(1, num_labels)
-        if stats[i, cv2.CC_STAT_AREA] > BAR_MIN_AREA
-    ]
-    if not blobs:
+    frags = sorted(
+        [
+            (stats[i, cv2.CC_STAT_TOP],
+             stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT],
+             stats[i, cv2.CC_STAT_AREA])
+            for i in range(1, num_labels)
+            if stats[i, cv2.CC_STAT_AREA] > BAR_MIN_AREA
+        ],
+        key=lambda f: f[0]
+    )
+    if not frags:
         return None
 
-    main = max(blobs, key=lambda b: b["area"])
+    # ── Gap-merge fragments split by an occluder (the fish sprite) ────────
+    merged = []
+    cur_top, cur_bot, cur_area = frags[0]
+    for top, bot, area in frags[1:]:
+        if top - cur_bot <= BAR_MERGE_GAP:
+            cur_bot   = max(cur_bot, bot)
+            cur_area += area
+        else:
+            merged.append((cur_top, cur_bot, cur_area))
+            cur_top, cur_bot, cur_area = top, bot, area
+    merged.append((cur_top, cur_bot, cur_area))
 
-    if main["height"] >= expected_h * 0.80:
-        top, bottom, partial, source = main["top"], main["bottom"], False, "full"
+    # Discard merged blobs too small to plausibly be the real bar
+    merged = [m for m in merged if m[2] >= BAR_MERGED_MIN_AREA]
+    if not merged:
+        return None
+
+    main_top, main_bot, main_area = max(merged, key=lambda m: m[2])
+    main_height = main_bot - main_top
+
+    if main_height >= expected_h * 0.80:
+        top, bottom, partial, source = main_top, main_bot, False, "full"
     elif fish_y is not None:
         fish_center_y = fish_y + fish_h // 2
-        if fish_center_y < main["top"]:
-            top    = main["top"] - (expected_h - main["height"])
-            bottom = main["bottom"]
+        if fish_center_y < main_top:
+            top    = main_top - (expected_h - main_height)
+            bottom = main_bot
             source = "partial_fish_above"
         else:
-            top    = main["top"]
-            bottom = main["top"] + expected_h
+            top    = main_top
+            bottom = main_top + expected_h
             source = "partial_fish_below"
         partial = True
     else:
-        top, bottom, partial, source = main["top"], main["bottom"], True, "partial_no_fish"
+        top, bottom, partial, source = main_top, main_bot, True, "partial_no_fish"
 
     return {"top": top, "bottom": bottom, "center": (top + bottom) // 2,
             "partial": partial, "source": source}
 
 
-# ── Physics model ─────────────────────────────────────────────────────────────
+# ── Physics model with online recalibration ──────────────────────────────────
 
 class BarPhysics:
-    def __init__(self):
-        self.center   = None 
-        self.vel      = 0.0  
-        self.last_t   = None
-        self.pressing = False 
+    """
+    Tracks the bar's center via a gravity + click-impulse model, and refines
+    its own GRAVITY / CLICK_ACCEL estimates from real detection data whenever
+    a clean single-state (press-only or release-only) window is observed
+    between two fresh, trustworthy detections.
 
+    Calibration logic:
+      - We log (timestamp, detected_center) every time a FRESH detection
+        succeeds, plus every press/release edge from the input listeners.
+      - When two consecutive fresh detections happen with NO press/release
+        edge in between (pure constant-state interval), the observed
+        acceleration during that interval is a clean physics sample:
+            observed_accel = 2 * (delta_x - v0*dt) / dt^2
+        which we don't have v0 for directly, so instead we use the
+        finite-difference of *velocity* across three consecutive fresh
+        samples (so we don't need to know v0 a priori):
+            v_mid = (x2 - x0) / (t2 - t0)   [central difference]
+        and accel = (v_late - v_early) / dt, blended into our running
+        estimate for whichever state (pressing/released) was constant
+        across the window.
+    """
+    def __init__(self):
+        self.center   = None
+        self.vel      = 0.0
+        self.last_t   = None
+        self.pressing = False
+
+        # Live-calibrated constants (start from init guesses)
+        self.gravity     = GRAVITY_INIT
+        self.click_accel = CLICK_ACCEL_INIT
+
+        # Rolling history of fresh detections: (t, center, pressing_state)
+        # Used to derive real accel samples for recalibration.
+        self._fresh_history = []
+        self._HISTORY_MAX = 5
+
+    # ── Detection-driven update ────────────────────────────────────────────
     def seed(self, detected_center):
         self.center = float(detected_center)
         self.vel    = 0.0
         self.last_t = time.perf_counter()
+        self._fresh_history.clear()
+        self._fresh_history.append((self.last_t, self.center, self.pressing))
 
     def correct(self, detected_center):
+        """Called every time a FRESH (non-stale) detection succeeds."""
+        now = time.perf_counter()
+
         if self.center is None:
             self.seed(detected_center)
             return
-        delta = detected_center - self.center
-        now = time.perf_counter()
-        dt  = now - self.last_t if self.last_t else 0.016
-        implied_vel = delta / dt if dt > 0 else 0.0
-        self.center += CORRECTION_ALPHA * delta
-        self.vel     = (1 - CORRECTION_ALPHA) * self.vel + CORRECTION_ALPHA * implied_vel
-        self.last_t  = now
 
+        dt = now - self.last_t if self.last_t else 0.016
+        delta = detected_center - self.center
+
+        # Hard-ish snap toward the trustworthy fresh detection.
+        implied_vel = delta / dt if dt > 0 else 0.0
+        self.center = (1 - DETECTION_SNAP_ALPHA) * self.center + DETECTION_SNAP_ALPHA * detected_center
+        self.vel    = (1 - DETECTION_SNAP_ALPHA) * self.vel    + DETECTION_SNAP_ALPHA * implied_vel
+        self.last_t = now
+
+        # ── Record this fresh sample and attempt recalibration ────────────
+        self._fresh_history.append((now, float(detected_center), self.pressing))
+        if len(self._fresh_history) > self._HISTORY_MAX:
+            self._fresh_history.pop(0)
+        self._try_recalibrate()
+
+    def _try_recalibrate(self):
+        """
+        Look for a clean 3-sample window in fresh-detection history where the
+        press state did NOT change, and derive an empirical acceleration
+        from the central-difference velocity change. Blend into our running
+        gravity / click_accel estimate.
+        """
+        h = self._fresh_history
+        if len(h) < 3:
+            return
+
+        t0, x0, p0 = h[-3]
+        t1, x1, p1 = h[-2]
+        t2, x2, p2 = h[-1]
+
+        # Need constant press-state across the whole window to attribute
+        # the observed acceleration to a single physical regime.
+        if not (p0 == p1 == p2):
+            return
+
+        dt_01 = t1 - t0
+        dt_12 = t2 - t1
+        if dt_01 <= 0 or dt_12 <= 0:
+            return
+
+        v_early = (x1 - x0) / dt_01
+        v_late  = (x2 - x1) / dt_12
+        dt_mid  = ((t2 - t0) / 2.0)
+        if dt_mid <= 0:
+            return
+
+        observed_accel = (v_late - v_early) / dt_mid
+
+        # Sanity bounds — reject wild outliers (occlusion glitches, etc.)
+        if abs(observed_accel) > 6000 or abs(observed_accel) < 50:
+            return
+
+        if p1:  # was pressing the whole window → net accel = gravity - click_accel
+            implied_click_accel = self.gravity - observed_accel
+            implied_click_accel = float(np.clip(implied_click_accel, 200, 8000))
+            self.click_accel = ((1 - ACCEL_LEARN_RATE) * self.click_accel
+                                + ACCEL_LEARN_RATE * implied_click_accel)
+        else:   # was released the whole window → net accel = gravity
+            implied_gravity = float(np.clip(observed_accel, 100, 5000))
+            self.gravity = ((1 - ACCEL_LEARN_RATE) * self.gravity
+                            + ACCEL_LEARN_RATE * implied_gravity)
+
+    # ── Integration step (runs every frame regardless of detection) ───────
     def step(self):
         if self.center is None:
             self.last_t = time.perf_counter()
@@ -156,9 +291,9 @@ class BarPhysics:
         dt  = now - self.last_t
         self.last_t = now
 
-        accel = GRAVITY
+        accel = self.gravity
         if self.pressing:
-            accel -= CLICK_ACCEL 
+            accel -= self.click_accel
 
         self.vel    += accel * dt
         self.center += self.vel * dt
@@ -170,9 +305,11 @@ class BarPhysics:
 
     def on_press(self):
         self.pressing = True
+        self._fresh_history.clear()   # state changed — don't mix regimes
 
     def on_release(self):
         self.pressing = False
+        self._fresh_history.clear()   # state changed — don't mix regimes
 
 
 # ── Input listeners ───────────────────────────────────────────────────────────
@@ -181,7 +318,7 @@ physics     = BarPhysics()
 stop_script = False
 
 click_log   = []
-MAX_LOG     = 200 
+MAX_LOG     = 200
 
 def _on_mouse_click(x, y, button, pressed):
     if button == pynmouse.Button.left:
@@ -200,7 +337,7 @@ def _on_key_press(key):
     if key == keyboard.Key.esc:
         stop_script = True
         return False
-    # Expanded listener: Stardew valley accepts Spacebar, C, and X 
+    # Stardew Valley also accepts Spacebar, C, and X for the fishing minigame
     if key == keyboard.Key.space or (hasattr(key, 'char') and key.char in ('c', 'x', 'C', 'X')):
         physics.on_press()
         click_log.append((time.perf_counter(), "down"))
@@ -261,12 +398,13 @@ def draw_debug(frame_bgr, fish_match, bar_detected, bar_estimated,
     hud_lines  = [
         (f"F:{frame_idx}{stale_str}", (255, 255, 255)),
         (f"Mouse:{mouse_str}",        mouse_col),
+        (f"g={physics.gravity:.0f} a={physics.click_accel:.0f}", (200, 200, 0)),
     ]
     for i, (ln, col) in enumerate(hud_lines):
         cv2.putText(vis, ln, (2, 12 + i * 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 2, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 0, 0), 2, cv2.LINE_AA)
         cv2.putText(vis, ln, (2, 12 + i * 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, col,     1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, col,     1, cv2.LINE_AA)
 
     fh       = vis.shape[0]
     strip_h  = 8
@@ -294,61 +432,95 @@ def draw_debug(frame_bgr, fish_match, bar_detected, bar_estimated,
 
 print("Debug capture running. Click freely — recording mouse + detection.")
 print("Press ESC to stop.")
+print(f"Physics log: {LOG_PATH}")
+
+log_file = open(LOG_PATH, "w", newline="")
+log_writer = csv.writer(log_file)
+log_writer.writerow([
+    "frame_idx", "t_perf", "fish_y", "fish_score",
+    "bar_top", "bar_bottom", "bar_center", "bar_partial", "bar_source",
+    "phys_center", "phys_vel", "gravity", "click_accel",
+    "pressing", "is_stale",
+])
 
 frame_idx = 0
 
-with mss.mss() as sct:
-    while not stop_script:
-        grabbed    = sct.grab(REGION)
-        frame_bgr  = cv2.cvtColor(np.array(grabbed), cv2.COLOR_BGRA2BGR)
-        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+try:
+    with mss.mss() as sct:
+        while not stop_script:
+            grabbed    = sct.grab(REGION)
+            frame_bgr  = cv2.cvtColor(np.array(grabbed), cv2.COLOR_BGRA2BGR)
+            frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-        if not is_valid_frame(frame_gray):
-            print("Minigame UI not detected — waiting...")
-            time.sleep(0.1)
-            continue
+            if not is_valid_frame(frame_gray):
+                print("Minigame UI not detected — waiting...")
+                time.sleep(0.1)
+                continue
 
-        fish_match = find_fish_template(frame_bgr)
-        fish_y     = fish_match[1] if fish_match else None
+            fish_match = find_fish_template(frame_bgr)
+            fish_y     = fish_match[1] if fish_match else None
 
-        bar_detected = find_green_bar(frame_bgr, fish_y=fish_y, level=FISHING_LEVEL)
-        is_stale     = bar_detected is None
+            bar_detected = find_green_bar(frame_bgr, fish_y=fish_y, level=FISHING_LEVEL)
+            is_stale     = bar_detected is None
 
-        if bar_detected is not None:
-            if physics.center is None:
-                physics.seed(bar_detected["center"])
-            else:
+            if bar_detected is not None and not bar_detected.get("partial"):
                 physics.correct(bar_detected["center"])
 
-        bar_estimated = physics.step()  
+            bar_estimated = physics.step()
 
-        if frame_idx % 10 == 0:
-            fish_str = f"fish=y{fish_y}" if fish_match else "fish=None"
-            if bar_detected:
-                bar_str = f"det={bar_detected['top']}-{bar_detected['bottom']} [{bar_detected['source']}]"
-            else:
-                bar_str = "det=None"
-            phys_str = f"phys_c={bar_estimated:.1f}" if bar_estimated else "phys=uninit"
-            print(f"[{frame_idx:04d}] {fish_str}  {bar_str}  {phys_str}  "
-                  f"vel={physics.vel:+.1f}  {'CLICK' if physics.pressing else 'idle'}")
+            log_writer.writerow([
+                frame_idx,
+                f"{time.perf_counter():.6f}",
+                fish_y if fish_y is not None else "",
+                f"{fish_match[2]:.4f}" if fish_match else "",
+                bar_detected["top"]    if bar_detected else "",
+                bar_detected["bottom"] if bar_detected else "",
+                bar_detected["center"] if bar_detected else "",
+                bar_detected.get("partial") if bar_detected else "",
+                bar_detected.get("source")  if bar_detected else "",
+                f"{bar_estimated:.2f}" if bar_estimated is not None else "",
+                f"{physics.vel:.2f}",
+                f"{physics.gravity:.1f}",
+                f"{physics.click_accel:.1f}",
+                int(physics.pressing),
+                int(is_stale),
+            ])
 
-        vis = draw_debug(frame_bgr, fish_match, bar_detected, bar_estimated,
-                         is_stale, physics.pressing, frame_idx)
+            if frame_idx % 10 == 0:
+                fish_str = f"fish=y{fish_y}" if fish_match else "fish=None"
+                if bar_detected:
+                    bar_str = f"det={bar_detected['top']}-{bar_detected['bottom']} [{bar_detected['source']}]"
+                else:
+                    bar_str = "det=None"
+                phys_str = f"phys_c={bar_estimated:.1f}" if bar_estimated else "phys=uninit"
+                print(f"[{frame_idx:04d}] {fish_str}  {bar_str}  {phys_str}  "
+                      f"vel={physics.vel:+.1f}  g={physics.gravity:.0f} a={physics.click_accel:.0f}  "
+                      f"{'CLICK' if physics.pressing else 'idle'}")
 
-        disp = cv2.resize(vis, (vis.shape[1] * 3, vis.shape[0]),
-                          interpolation=cv2.INTER_NEAREST)
-        cv2.imshow("Debug Capture", disp)
+            vis = draw_debug(frame_bgr, fish_match, bar_detected, bar_estimated,
+                             is_stale, physics.pressing, frame_idx)
 
-        cv2.imwrite(os.path.join(FRAMES_DIR, f"frame_{frame_idx:04d}.png"), vis)
+            disp = cv2.resize(vis, (vis.shape[1] * 3, vis.shape[0]),
+                              interpolation=cv2.INTER_NEAREST)
+            cv2.imshow("Debug Capture", disp)
 
-        frame_idx += 1
+            cv2.imwrite(os.path.join(FRAMES_DIR, f"frame_{frame_idx:04d}.png"), vis)
 
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
+            frame_idx += 1
 
-        time.sleep(0.016)
+            if frame_idx % 50 == 0:
+                log_file.flush()
 
-cv2.destroyAllWindows()
-mouse_listener.stop()
-key_listener.stop()
-print(f"\nDone. {frame_idx} frames saved to: {FRAMES_DIR}")
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+            time.sleep(0.016)
+
+finally:
+    cv2.destroyAllWindows()
+    mouse_listener.stop()
+    key_listener.stop()
+    log_file.flush()
+    log_file.close()
+    print(f"\nDone. {frame_idx} frames saved to: {FRAMES_DIR}")
+    print(f"Physics log saved to: {LOG_PATH}")
